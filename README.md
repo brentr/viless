@@ -3,10 +3,12 @@ viless:  A tiny vi text editor clone with enough features to be truly useful
 ~30 Kbyte executable size (32-bit ARM Linux gcc)
 
 Copyright (C) 2000, 2001 Sterling Huxley <sterling@europa.com>
+
 Revised:  5/18/20 by Brent Roman <brent@mbari.org>
 
 Licensed under the GPL v2 or later
 
+<pre>
 Lifted from BusyBox 1.21
 Modified to build stand-alone, fix bugs, improve status line display
 30 Kb executable size on ARM with all features enabled
@@ -37,4 +39,4 @@ Things To Do:
 	":r !cmd"  and  "!cmd"  to filter text through an external command
 	A true "undo" facility
 	An "ex" line oriented mode- maybe using "cmdedit"
-
+</pre>
