@@ -1,4 +1,5 @@
 viless:  A tiny vi text editor clone with enough features to be truly useful
+
 ~30 Kbyte executable size (32-bit ARM Linux gcc)
 
 Copyright (C) 2000, 2001 Sterling Huxley <sterling@europa.com>
