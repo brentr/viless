@@ -1,4 +1,5 @@
-viless 30Kbyte vi text editor clone
+viless:  A tiny vi text editor clone with enough features to be truly useful
+~30 Kbyte executable size (32-bit ARM Linux gcc)
 
 Copyright (C) 2000, 2001 Sterling Huxley <sterling@europa.com>
 Revised:  5/18/20 by Brent Roman <brent@mbari.org>
@@ -7,7 +8,7 @@ Licensed under the GPL v2 or later
 
 Lifted from BusyBox 1.21
 Modified to build stand-alone, fix bugs, improve status line display
-30Kb executable size on ARM with all features enabled
+30 Kb executable size on ARM with all features enabled
 Lacks support for regular expressions
 Implements only the most commonly used : commands
 
