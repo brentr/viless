@@ -5,7 +5,7 @@
  *
  * Licensed under the GPL v2 or later, see the file LICENSE in this tarball.
  * Revised:  4/23/20 brent@mbari.org -- NULL ptr deref on missing previous regex
- * Revised:	 5/18/20 brent@mbari.org
+ * Revised:	 5/21/20 brent@mbari.org -- extensive rework
  */
 
 /*
@@ -24,7 +24,7 @@
  */
 
 #ifdef STANDALONE
-#define BB_VER "version 2.61"
+#define BB_VER "version 2.62"
 #define BB_BT "brent@mbari.org"
 
 #define _GNU_SOURCE
@@ -421,7 +421,7 @@ static char *text_hole_delete(char *, char *);	// at "p", delete a 'size' byte h
 static char *text_hole_make(char *, int);	// at "p", make a 'size' byte hole
 static char *yank_delete(char *, char *, int, int);	// yank text[] into register then delete
 static void show_help(void);	// display some help info
-static void rawmode(void);	// set "raw" mode on tty
+static int rawmode(void);	// set "raw" mode on tty
 static void cookmode(void);	// return to "cooked" mode on tty
 static int awaitInput(int); //for specified number of 1/100th seconds
 static char readit(void);	// read (maybe cursor) key from stdin
@@ -645,7 +645,6 @@ static void gracefulExit(void)
 	fflush(stdout);
 }
 
-#if ENABLE_FEATURE_VI_WIN_RESIZE
 void clampScreenSize(void)
 {
 	if (rows < 2)
@@ -658,6 +657,7 @@ void clampScreenSize(void)
 		columns = MAX_SCR_COLS;
 }
 
+#if ENABLE_FEATURE_VI_WIN_RESIZE
 static const char *snchr(const char *s, int c, size_t n)
 {
 	while (n--)
@@ -694,17 +694,17 @@ static void queueAnyInput(void)
 	}
 }
 
-int getScreenSize(unsigned *width, unsigned *height)
-// assigns width and height to screen size
-// If all else fails, try querying the terminal emulator for its screen size
-//    using VT100 escape codes
-// returns 0 if successful
-// Does not alter *width or *height unless successful
+void getScreenSize(void)
+// assigns width and height to best guess as to actual screen size
+// LINES and COLUMNS env vars take priority
+// If either missing, query the terminal using VT100 escape codes
+// 		If that fails, fall back to rows/cols info in the termios struct
+// rows and columns retain their previous values if all methods fail
 {
 	struct winsize win = { 0, 0, 0, 0 };
-	int err = ioctl(STDIN_FILENO, TIOCGWINSZ, &win);
-	if (err || !win.ws_row || !win.ws_col) {
-		err = -ENOENT;
+	const char *lines = getenv("LINES");
+	const char *cols = getenv("COLUMNS");
+	if (!lines || !cols) {  //if either missing in the environment
 		queueAnyInput();
 		if (!awaitInput(0)) {  //can't query term if there's pending user input
 			write1(CtextAreaQuery);
@@ -719,22 +719,22 @@ int getScreenSize(unsigned *width, unsigned *height)
 					ul = strtoul(term+1, &term, 10);
 					if (*term == 'R') {
 						win.ws_col = ul;
-						err = 0;
 					}
 				}
 			}
 		}
+		if (!win.ws_row || !win.ws_col)  //try termios if textAreaQuery failed
+			ioctl(STDIN_FILENO, TIOCGWINSZ, &win);
 	}
-	if (!err)
-		if (win.ws_row && win.ws_col) {
-			if (height)
-				*height = (int) win.ws_row;
-			if (width)
-				*width = (int) win.ws_col;
-		else
-			err = -ENOENT;
-		}
-	return err;
+	//environment variables trump all
+	if (lines)
+		rows = atoi(lines);
+	else if (win.ws_row)
+		rows = win.ws_row;
+	if (cols)
+		columns = atoi(cols);
+	else if (win.ws_col)
+		columns = win.ws_col;
 }
 #endif
 
@@ -742,7 +742,7 @@ int getScreenSize(unsigned *width, unsigned *height)
 static void createScreen(void)
 {
 #if ENABLE_FEATURE_VI_WIN_RESIZE
-	getScreenSize(&columns, &rows);
+	getScreenSize();
 	clampScreenSize();
 #endif
 	new_screen(rows, columns);	// get memory for virtual screen
@@ -757,7 +757,7 @@ int vi_main(int argc, char **argv)
 	INIT_G();
 	rows = 24;
 	columns = 80;
-#if ENABLE_FEATURE_VI_WIN_RESIZE
+#if !ENABLE_FEATURE_VI_WIN_RESIZE
 	{  //try to get terminal dimensions from environment
 		char *txt = getenv("LINES");
 		if (txt)
@@ -883,7 +883,10 @@ static void edit_file(char *fn)
 #endif
 	char c;
 	editing = 1;	// 0 = exit, 1 = one file, 2 = multiple files
-	rawmode();
+	if (rawmode()) {
+		perror("vi");
+		exit(5);
+	}
 	createScreen();
 	init_text_buffer(fn);
 
@@ -2334,8 +2337,9 @@ static void show_help(void)
 	"\n\tSignal catching- ^C"
 	"\n\tJob suspend and resume with ^Z"
 #endif
+	"\n\tLINES and COLUMNS env vars determine window size"
 #if ENABLE_FEATURE_VI_WIN_RESIZE
-	"\n\tAdapt to window re-sizes"
+	"\n\tAdapt to window re-sizes (if LINES and COLUMNS env vars unset!)"
 #endif
 	);
 }
@@ -2456,9 +2460,11 @@ static char *swap_context(char *p) // goto new context for '' command make this 
 #endif /* FEATURE_VI_YANKMARK */
 
 //----- Set terminal attributes --------------------------------
-static void rawmode(void)
+static int rawmode(void)
 {
-	tcgetattr(0, &term_orig);
+	int err = tcgetattr(0, &term_orig);
+	if (err)
+		return err;
 	term_vi = term_orig;
 	term_vi.c_lflag &= (~ICANON & ~ECHO);	// leave ISIG ON- allow intr's
 	term_vi.c_iflag &= (~IXON & ~ICRNL);
@@ -2495,6 +2501,7 @@ static void rawmode(void)
 		tics = 21;
 	} //determines how long to wait for ESCAPE sequences
 	ticsPerChar = tics;
+	return 0;
 }
 
 static void cookmode(void)
