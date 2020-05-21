@@ -24,7 +24,7 @@
  */
 
 #ifdef STANDALONE
-#define BB_VER "version 2.60"
+#define BB_VER "version 2.61"
 #define BB_BT "brent@mbari.org"
 
 #define _GNU_SOURCE
@@ -183,7 +183,7 @@ static const char Ceos[] ALIGN1 = "\033[0J";
 static const char CMrc[] ALIGN1 = "\033[%d;%dH";
 #if ENABLE_FEATURE_VI_WIN_RESIZE
 /* Report cursor positon */
-static const char CtextAreaQuery[] ALIGN1 = "\033[18t";
+static const char CtextAreaQuery[] ALIGN1 = "\033[r\033[999;999H\033[6n";
 #endif
 #ifdef ENABLE_FEATURE_VI_OPTIMIZE_CURSOR
 /* Cursor motion up and down ESC sequence */
@@ -709,16 +709,15 @@ int getScreenSize(unsigned *width, unsigned *height)
 		if (!awaitInput(0)) {  //can't query term if there's pending user input
 			write1(CtextAreaQuery);
 			char buf[16];
-			int rspLen = readResponse(buf, sizeof(buf)-1, 't');
-			if (rspLen > 7 && buf[0]==27 && buf[1]=='[' &&
-				buf[2]=='8' && buf[3]==';') {
+			int rspLen = readResponse(buf, sizeof(buf)-1, 'R');
+			if (rspLen > 5 && buf[0]==27 && buf[1]=='[') {
 				buf[rspLen]=0; //terminate response string
 				char *term;
-				unsigned long ul = strtoul(buf+4, &term, 10);
+				unsigned long ul = strtoul(buf+2, &term, 10);
 				if (*term == ';') {
 					win.ws_row = ul;
 					ul = strtoul(term+1, &term, 10);
-					if (*term == 't') {
+					if (*term == 'R') {
 						win.ws_col = ul;
 						err = 0;
 					}
@@ -883,10 +882,6 @@ static void edit_file(char *fn)
 #define cur_line edit_file__cur_line
 #endif
 	char c;
-#if ENABLE_FEATURE_VI_USE_SIGNALS
-	int sig;
-#endif
-
 	editing = 1;	// 0 = exit, 1 = one file, 2 = multiple files
 	rawmode();
 	createScreen();
@@ -901,14 +896,13 @@ static void edit_file(char *fn)
 	last_forward_char = last_input_char = '\0';
 	crow = 0;
 	ccol = 0;
+	tabstop = 8;
+	offset = 0;			// no horizontal offset
 	clear_screen();
 
 #if ENABLE_FEATURE_VI_USE_SIGNALS
 	catch_sig(0);
-	sig = sigsetjmp(restart, 1);
-	if (sig != 0) {
-		screenbegin = dot = text;
-	}
+	sigsetjmp(restart, 1);
 	signal(SIGWINCH, winch_sig);
 	signal(SIGTSTP, suspend_sig);
 	signal(SIGQUIT, quit_sig);
@@ -923,8 +917,6 @@ static void edit_file(char *fn)
 
 	cmd_mode = CMODE_COMMAND;
 	cmdcnt = 0;
-	tabstop = 8;
-	offset = 0;			// no horizontal offset
 	c = '\0';
 #if ENABLE_FEATURE_VI_DOT_CMD
 	free(ioq_start);
