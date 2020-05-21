@@ -24,7 +24,7 @@
  */
 
 #ifdef STANDALONE
-#define BB_VER "version 2.58"
+#define BB_VER "version 2.60"
 #define BB_BT "brent@mbari.org"
 
 #define _GNU_SOURCE
@@ -79,6 +79,8 @@
 #define ARRAY_SIZE(x) ((unsigned)(sizeof(x) / sizeof((x)[0])))
 
 #define INIT_G()
+struct globals G;
+
 typedef signed char smallint;
 
 #define bb_show_usage()
@@ -179,6 +181,10 @@ static const char Ceol[] ALIGN1 = "\033[0K";
 static const char Ceos[] ALIGN1 = "\033[0J";
 /* Cursor motion arbitrary destination ESC sequence */
 static const char CMrc[] ALIGN1 = "\033[%d;%dH";
+#if ENABLE_FEATURE_VI_WIN_RESIZE
+/* Report cursor positon */
+static const char CtextAreaQuery[] ALIGN1 = "\033[18t";
+#endif
 #ifdef ENABLE_FEATURE_VI_OPTIMIZE_CURSOR
 /* Cursor motion up and down ESC sequence */
 static const char CMup[] ALIGN1 = "\033[A";
@@ -301,16 +307,13 @@ struct globals {
 	sigjmp_buf restart;     // catch_sig()
 #endif
 	struct termios term_orig, term_vi; // remember what the cooked mode was
+	unsigned ticsPerChar;	//# of 100hz tics per character received
 #if ENABLE_FEATURE_VI_COLON
 	char *initial_cmds[3];  // currently 2 entries, NULL terminated
 #endif
 	// Should be just enough to hold a key sequence,
 	// but CRASME mode uses it as generated command buffer too
-#if ENABLE_FEATURE_VI_CRASHME
 	char readbuffer[128];
-#else
-	char readbuffer[32];
-#endif
 #define STATUS_BUFFER_LEN  200
 	char status_buffer[STATUS_BUFFER_LEN]; // messages to the user
 	char displayed_buffer[STATUS_BUFFER_LEN];  //  displayed status
@@ -376,6 +379,7 @@ struct globals {
 #define context_end    (G.context_end   )
 #define restart        (G.restart       )
 #define term_orig      (G.term_orig     )
+#define ticsPerChar	   (G.ticsPerChar   )
 #define term_vi        (G.term_vi       )
 #define initial_cmds   (G.initial_cmds  )
 #define readbuffer     (G.readbuffer    )
@@ -419,8 +423,7 @@ static char *yank_delete(char *, char *, int, int);	// yank text[] into register
 static void show_help(void);	// display some help info
 static void rawmode(void);	// set "raw" mode on tty
 static void cookmode(void);	// return to "cooked" mode on tty
-// sleep for 'h' 1/100 seconds, return 1/0 if stdin is (ready for read)/(not ready)
-static int mysleep(int);
+static int awaitInput(int); //for specified number of 1/100th seconds
 static char readit(void);	// read (maybe cursor) key from stdin
 static char get_one_char(void);	// read 1 char from stdin
 static int file_size(const char *);   // what is the byte size of "fn"
@@ -445,9 +448,9 @@ static void status_line(const char *, ...);     // print to status buf
 static void status_line_bold(const char *, ...);
 static void not_implemented(const char *); // display "Not implemented" message
 static int format_edit_status(const char *fmt); //file status on status line
-static void redraw(int);	// force a full screen refresh
+static void redraw(void);	// force a full screen refresh
 static char* format_line(char* /*, int*/);
-static void refresh(int);	// update the terminal from screen[]
+static void refresh(void);	// update the terminal from screen[]
 
 static void Indicate_Error(void);       // use flash or beep to indicate error
 #define indicate_error(c) Indicate_Error()
@@ -466,6 +469,7 @@ static void colon(char *);	// execute the "colon" mode cmds
 static void winch_sig(int);	// catch window size changes
 static void suspend_sig(int);	// catch ctrl-Z
 static void catch_sig(int);     // catch ctrl-C and alarm time-outs
+static void quit_sig(int);		// catch QUIT, TERM, PIPE, or HUP
 #endif
 #if ENABLE_FEATURE_VI_DOT_CMD
 static void start_new_cmd_q(char);	// new queue for command
@@ -489,6 +493,7 @@ static void crash_dummy();
 static void crash_test();
 static int crashme = 0;
 #endif
+
 
 #ifdef STANDALONE
 void *xmalloc(size_t size)
@@ -526,27 +531,6 @@ void *xrealloc(void *old, size_t size)
 	if (ptr) return ptr;
 	perror("realloc");
 	exit(68);
-}
-
-void get_terminal_width_height(int fd, unsigned *width, unsigned *height)
-{
-	struct winsize win = { 0, 0, 0, 0 };
-	if (ioctl(fd, TIOCGWINSZ, &win) != 0) {
-		win.ws_row = 24;
-		win.ws_col = 80;
-	}
-	if (win.ws_row <= 1) {
-		win.ws_row = 24;
-	}
-	if (win.ws_col <= 1) {
-		win.ws_col = 80;
-	}
-	if (height) {
-		*height = (int) win.ws_row;
-	}
-	if (width) {
-		*width = (int) win.ws_col;
-	}
 }
 
 /* Find out if the last character of a string matches the one given.
@@ -640,8 +624,6 @@ ssize_t full_write(int fd, const void *buf, size_t len)
 
 	return total;
 }
-
-  struct globals G;
 #endif
 
 static void write1(const char *out)
@@ -653,8 +635,120 @@ static void clear_screen(void)
 {
 	place_cursor(0, 0, FALSE);	// put cursor in correct place
 	clear_to_eos();		// tell terminal to erase display
-	screen_erase();		// erase the internal screen buffer
 }
+
+static void gracefulExit(void)
+{
+	cookmode();
+	place_cursor(rows-1, 0, FALSE);	// go to bottom of screen
+	clear_to_eol();		// Erase to end of line
+	fflush(stdout);
+}
+
+#if ENABLE_FEATURE_VI_WIN_RESIZE
+void clampScreenSize(void)
+{
+	if (rows < 2)
+		rows = 2;
+	else if (rows > MAX_SCR_ROWS)
+		rows = MAX_SCR_ROWS;
+	if (columns < 2)
+		columns = 2;
+	else if (columns > MAX_SCR_COLS)
+		columns = MAX_SCR_COLS;
+}
+
+static const char *snchr(const char *s, int c, size_t n)
+{
+	while (n--)
+		if (*s++ == c) return --s;
+	return NULL;
+}
+
+static ssize_t
+  readResponse(char *buf, size_t bufSize, int endByte)
+//read response from STDIN into buf until timeout or endByte received
+{
+	size_t cursor = 0;
+	while (cursor < bufSize) {
+		if (!awaitInput(ticsPerChar+9))
+			return -ETIME;
+		int r = safe_read(STDIN_FILENO, buf + cursor, bufSize - cursor);
+		if (r <= 0)
+			return r < 0 ? r : -EIO;
+		if (snchr(buf+cursor, endByte, r))
+			return cursor + r;
+		cursor += r;
+	}
+	return -E2BIG;
+}
+
+static void queueAnyInput(void)
+//add any pending user input to readbuffer
+{
+	if (awaitInput(0)) {
+	  char *s = readbuffer + chars_to_parse;
+	  int r = safe_read(STDIN_FILENO, s, readbuffer+sizeof(readbuffer) - s);
+	  if (r > 0)
+	    chars_to_parse += r;
+	}
+}
+
+int getScreenSize(unsigned *width, unsigned *height)
+// assigns width and height to screen size
+// If all else fails, try querying the terminal emulator for its screen size
+//    using VT100 escape codes
+// returns 0 if successful
+// Does not alter *width or *height unless successful
+{
+	struct winsize win = { 0, 0, 0, 0 };
+	int err = ioctl(STDIN_FILENO, TIOCGWINSZ, &win);
+	if (err || !win.ws_row || !win.ws_col) {
+		err = -ENOENT;
+		queueAnyInput();
+		if (!awaitInput(0)) {  //can't query term if there's pending user input
+			write1(CtextAreaQuery);
+			char buf[16];
+			int rspLen = readResponse(buf, sizeof(buf)-1, 't');
+			if (rspLen > 7 && buf[0]==27 && buf[1]=='[' &&
+				buf[2]=='8' && buf[3]==';') {
+				buf[rspLen]=0; //terminate response string
+				char *term;
+				unsigned long ul = strtoul(buf+4, &term, 10);
+				if (*term == ';') {
+					win.ws_row = ul;
+					ul = strtoul(term+1, &term, 10);
+					if (*term == 't') {
+						win.ws_col = ul;
+						err = 0;
+					}
+				}
+			}
+		}
+	}
+	if (!err)
+		if (win.ws_row && win.ws_col) {
+			if (height)
+				*height = (int) win.ws_row;
+			if (width)
+				*width = (int) win.ws_col;
+		else
+			err = -ENOENT;
+		}
+	return err;
+}
+#endif
+
+
+static void createScreen(void)
+{
+#if ENABLE_FEATURE_VI_WIN_RESIZE
+	getScreenSize(&columns, &rows);
+	clampScreenSize();
+#endif
+	new_screen(rows, columns);	// get memory for virtual screen
+}
+
 
 int vi_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int vi_main(int argc, char **argv)
@@ -662,6 +756,19 @@ int vi_main(int argc, char **argv)
 	int c;
 
 	INIT_G();
+	rows = 24;
+	columns = 80;
+#if ENABLE_FEATURE_VI_WIN_RESIZE
+	{  //try to get terminal dimensions from environment
+		char *txt = getenv("LINES");
+		if (txt)
+			rows = atoi(txt);
+		txt = getenv("COLUMNS");
+		if (txt)
+			columns = atoi(txt);
+		clampScreenSize();
+	}
+#endif
 
 #if ENABLE_FEATURE_VI_USE_SIGNALS || ENABLE_FEATURE_VI_CRASHME
 	my_pid = getpid();
@@ -691,7 +798,7 @@ int vi_main(int argc, char **argv)
 			initial_cmds[0] = xstrndup(p, MAX_INPUT_LEN);
 	}
 #endif
-	while ((c = getopt(argc, argv, "hCRH" USE_FEATURE_VI_COLON("c:"))) != -1) {
+	while ((c = getopt(argc, argv, "hCRH-" USE_FEATURE_VI_COLON("c:"))) != -1) {
 		switch (c) {
 #if ENABLE_FEATURE_VI_CRASHME
 		case 'C':
@@ -710,6 +817,7 @@ int vi_main(int argc, char **argv)
 			break;
 #endif
 		case 'H':
+		case '-':
 			show_help();
 			/* fall through */
 		default:
@@ -781,14 +889,7 @@ static void edit_file(char *fn)
 
 	editing = 1;	// 0 = exit, 1 = one file, 2 = multiple files
 	rawmode();
-	rows = 24;
-	columns = 80;
-	if (ENABLE_FEATURE_VI_WIN_RESIZE) {
-		get_terminal_width_height(0, &columns, &rows);
-		if (rows > MAX_SCR_ROWS) rows = MAX_SCR_ROWS;
-		if (columns > MAX_SCR_COLS) columns = MAX_SCR_COLS;
-	}
-	new_screen(rows, columns);	// get memory for virtual screen
+	createScreen();
 	init_text_buffer(fn);
 
 #if ENABLE_FEATURE_VI_YANKMARK
@@ -800,15 +901,24 @@ static void edit_file(char *fn)
 	last_forward_char = last_input_char = '\0';
 	crow = 0;
 	ccol = 0;
+	clear_screen();
 
 #if ENABLE_FEATURE_VI_USE_SIGNALS
 	catch_sig(0);
-	signal(SIGWINCH, winch_sig);
-	signal(SIGTSTP, suspend_sig);
 	sig = sigsetjmp(restart, 1);
 	if (sig != 0) {
 		screenbegin = dot = text;
 	}
+	signal(SIGWINCH, winch_sig);
+	signal(SIGTSTP, suspend_sig);
+	signal(SIGQUIT, quit_sig);
+	signal(SIGTERM, quit_sig);
+	signal(SIGPIPE, quit_sig);
+	signal(SIGHUP, quit_sig);
+	signal(SIGILL, quit_sig);
+	signal(SIGSEGV, quit_sig);
+	signal(SIGBUS, quit_sig);
+	signal(SIGABRT, quit_sig);
 #endif
 
 	cmd_mode = CMODE_COMMAND;
@@ -844,10 +954,10 @@ static void edit_file(char *fn)
 		}
 	}
 #endif
-	clear_screen();
+
 	//------This is the main Vi cmd handling loop -----------------------
 	while (editing > 0) {
-		refresh(FALSE);
+		refresh();
 #if ENABLE_FEATURE_VI_CRASHME
 		if (crashme > 0) {
 			if ((end - text) > 1) {
@@ -878,24 +988,14 @@ static void edit_file(char *fn)
 		}
 #endif
 		do_cmd(c);		// execute the user command
-		//
-		// poll to see if there is input already waiting. if we are
-		// not able to display output fast enough to keep up, skip
-		// the display update until we catch up with input.
-		if (mysleep(0) == 0) {
-			// no input pending- so update output
-			refresh(FALSE);
-		}
 #if ENABLE_FEATURE_VI_CRASHME
 		if (crashme > 0)
 			crash_test();	// test editor variables
 #endif
 	}
 	//-------------------------------------------------------------------
-
-	place_cursor(rows, 0, FALSE);	// go to bottom of screen
-	clear_to_eol();		// Erase to end of line
-	cookmode();
+	refresh();
+	gracefulExit();
 #undef cur_line
 }
 
@@ -1017,10 +1117,10 @@ static void showmatching(char *p)
 		// "q" now points to matching pair
 		save_dot = dot;	// remember where we are
 		dot = q;		// go to new loc
-		refresh(FALSE);	// let the user see it
-		mysleep(40);	// give user some time
+		refresh();		// let the user see it
+		awaitInput(40);	// give user some time
 		dot = save_dot;	// go back to old loc
-		refresh(FALSE);
+		refresh();
 	}
 }
 
@@ -1482,7 +1582,7 @@ static void Hit_Return(void)
 	standout_end();
 	while ((c = get_one_char()) != '\n' && c != '\r' && c != 27)
 		continue;
-	redraw(TRUE);		// force redraw all
+	redraw();
 }
 
 static int next_tabstop(int col)
@@ -1796,17 +1896,10 @@ static char *bound_dot(char *p) // make sure  text[0] <= P < "end"
 
 static char *new_screen(int ro, int co)
 {
-	int li;
-
 	free(screen);
 	screensize = ro * co + 8;
 	screen = xmalloc(screensize);
-	// initialize the new screen. assume this will be a empty file.
 	screen_erase();
-	//   non-existent text[] lines start with a tilde (~).
-	for (li = 1; li < ro - 1; li++) {
-		screen[(li * co) + 0] = '~';
-	}
 	return screen;
 }
 
@@ -1921,7 +2014,7 @@ static char *char_insert(char *p, char c) // insert the char c at 'p'
 	if (c == 22) {		// Is this an ctrl-V?
 		p = stupid_insert(p, '^');	// use ^ to indicate literal next
 		p--;			// backup onto ^
-		refresh(FALSE);	// show the ^
+		refresh();		// show the ^
 		c = get_one_char();
 		*p = c;
 		p++;
@@ -2382,11 +2475,38 @@ static void rawmode(void)
 	term_vi.c_cc[VTIME] = 0;
 	erase_char = term_vi.c_cc[VERASE];
 	tcsetattr(0, TCSANOW, &term_vi);
+
+	unsigned tics = 1;
+    switch (cfgetispeed(&term_vi)) {
+	case B600:
+		tics = 2;
+		break;
+	case B300:
+		tics = 4;
+		break;
+	case B200:
+		tics = 6;
+		break;
+	case B150:
+		tics = 7;
+		break;
+	case B134:
+		tics = 8;
+		break;
+	case B110:
+		tics = 10;
+		break;
+	case B75:
+		tics = 15;
+		break;
+	case B50:
+		tics = 21;
+	} //determines how long to wait for ESCAPE sequences
+	ticsPerChar = tics;
 }
 
 static void cookmode(void)
 {
-	fflush(stdout);
 	tcsetattr(0, TCSANOW, &term_orig);
 }
 
@@ -2394,23 +2514,27 @@ static void cookmode(void)
 #if ENABLE_FEATURE_VI_USE_SIGNALS
 static void winch_sig(int sig ATTRIBUTE_UNUSED)
 {
-	// FIXME: do it in main loop!!!
-	if (ENABLE_FEATURE_VI_WIN_RESIZE) {
-		get_terminal_width_height(0, &columns, &rows);
-		if (rows > MAX_SCR_ROWS) rows = MAX_SCR_ROWS;
-		if (columns > MAX_SCR_COLS) columns = MAX_SCR_COLS;
-	}
-	new_screen(rows, columns);	// get memory for virtual screen
-	redraw(TRUE);		// re-draw the screen
+	createScreen();
+	redraw();
+	fflush(stdout);
 }
+
+//----- Come here on QUIT, PIPE, TERM, HUP ----------------------
+static void quit_sig(int sig)
+{
+	gracefulExit();
+	signal(sig, SIG_DFL);
+	kill(my_pid, sig);
+}
+
 
 //----- Come here when we get a continue signal -------------------
 static void cont_sig(int sig ATTRIBUTE_UNUSED)
 {
 	rawmode();			// terminal to "raw"
 	*status_buffer=0;	// force status update
-	redraw(TRUE);		// re-draw the screen
-
+	redraw();
+	fflush(stdout);
 	signal(SIGTSTP, suspend_sig);
 	signal(SIGCONT, SIG_DFL);
 	kill(my_pid, SIGCONT);
@@ -2419,16 +2543,13 @@ static void cont_sig(int sig ATTRIBUTE_UNUSED)
 //----- Come here when we get a Suspend signal -------------------
 static void suspend_sig(int sig ATTRIBUTE_UNUSED)
 {
-	place_cursor(rows - 1, 0, FALSE);	// go to bottom of screen
-	clear_to_eol();		// Erase to end of line
-	cookmode();			// terminal to "cooked"
-
+	gracefulExit();
 	signal(SIGCONT, cont_sig);
 	signal(SIGTSTP, SIG_DFL);
 	kill(my_pid, SIGTSTP);
 }
 
-//----- Come here when we get a signal ---------------------------
+//----- Come here when we get a INT signal ---------------------------
 static void catch_sig(int sig)
 {
 	signal(SIGINT, catch_sig);
@@ -2437,20 +2558,23 @@ static void catch_sig(int sig)
 }
 #endif /* FEATURE_VI_USE_SIGNALS */
 
-static int mysleep(int hund)	// sleep for 'h' 1/100 seconds
+static int awaitInput(int tics)
+//returns true if input is becomes available within tics/100 seconds
 {
+	fflush(stdout);
+	tcdrain(STDOUT_FILENO);
 	struct pollfd pfd[1];
 
 	pfd[0].fd = 0;
 	pfd[0].events = POLLIN;
-	return safe_poll(pfd, 1, hund*10) > 0;
+	return safe_poll(pfd, 1, tics*10) > 0;
 }
 
 //----- IO Routines --------------------------------------------
 static char readit(void)	// read (maybe cursor) key from stdin
 {
 	char c;
-	int n;
+	size_t n;
 	struct esc_cmds {
 		const char seq[4];
 		char val;
@@ -2495,11 +2619,11 @@ static char readit(void)	// read (maybe cursor) key from stdin
 	};
 	enum { ESCCMDS_COUNT = ARRAY_SIZE(esccmds) };
 
-	fflush(stdout);
 	n = chars_to_parse;
 	// get input from User- are there already input chars in Q?
 	if (n <= 0) {
 		// the Q is empty, wait for a typed char
+		fflush(stdout);
 		n = safe_read(STDIN_FILENO, readbuffer, sizeof(readbuffer));
 		if (n < 0) {
 			if (errno == EBADF || errno == EFAULT || errno == EINVAL
@@ -2514,18 +2638,17 @@ static char readit(void)	// read (maybe cursor) key from stdin
 			// Could be bare Esc key. See if there are any
 			// more chars to read after the ESC. This would
 			// be a Function or Cursor Key sequence.
-			struct pollfd pfd[1];
-			pfd[0].fd = 0;
-			pfd[0].events = POLLIN;
-			// keep reading while there are input chars, and room in buffer
+			// keep reading while there are input chars and room in buffer
 			// for a complete ESC sequence (assuming 8 chars is enough)
-			while ((safe_poll(pfd, 1, 0) > 0)
-			 && ((size_t)n <= (sizeof(readbuffer) - 8))
-			) {
+			while(awaitInput(ticsPerChar)) {
 				// read the rest of the ESC string
-				int r = safe_read(STDIN_FILENO, readbuffer + n, sizeof(readbuffer) - n);
-				if (r > 0)
-					n += r;
+				int r = safe_read(STDIN_FILENO,
+						readbuffer + n, sizeof(readbuffer) - n);
+				if (r <= 0)
+					break;
+				n += r;
+				if (n > sizeof(readbuffer)-8)
+					break;
 			}
 		}
 		chars_to_parse = n;
@@ -2548,7 +2671,7 @@ static char readit(void)	// read (maybe cursor) key from stdin
 		// defined ESC sequence not found
 	}
 	n = 1;
- found:
+found:
 	// remove key sequence from Q
 	chars_to_parse -= n;
 	memmove(readbuffer, readbuffer + n, sizeof(readbuffer) - n);
@@ -2831,10 +2954,10 @@ static void standout_end(void) // send "end reverse video" sequence
 static void flash(int h)
 {
 	standout_start();	// send "start reverse video" sequence
-	redraw(TRUE);
-	mysleep(h);
+	redraw();
+	awaitInput(h);
 	standout_end();		// send "end reverse video" sequence
-	redraw(TRUE);
+	redraw();
 }
 
 static void Indicate_Error(void)
@@ -2881,20 +3004,15 @@ static void show_status_line(void)
 		size_t escapes = *buffer == *SOs ? 2*SOlen : 0;
 		place_cursor(rows - 1,	// put cursor on status line
 			escapes ? unchanged - SOlen : unchanged, FALSE);
-		clear_to_eol();
-		if (unchanged && escapes) { //need to start in stand-out mode
-			unsigned count = SOlen;
-			do  //NOTE:  this assumes entire status text was in stand-out mode
-				putchar(*buffer++);
-			while(--count);
-		}
+		clear_to_eol(); //NOTE: assumes entire status text was in stand-out mode
+		if (unchanged && escapes)   //need to start in stand-out mode
+			fwrite(buffer, SOlen, 1, stdout);
 		size_t len = unchanged + strlen(buffer=changed);
 		if (len - escapes > columns) {
 			const char *limit = status_buffer + columns;
 			if (escapes)
 				limit += SOlen;
-			while(buffer<limit)
-				putchar(*buffer++);
+			fwrite(buffer, limit-buffer, 1, stdout);
 			buffer = status_buffer + len;
 			if (escapes && len > 2*SOlen) //end w/restore to normal ESC sequence
 				buffer-=SOlen;
@@ -2906,7 +3024,6 @@ static void show_status_line(void)
 		place_cursor(rows-1, strlen(buffer), FALSE);  //put cursor at its end
 	else  //put cursor back in text area
 		place_cursor(crow, ccol, TRUE);
-	fflush(stdout);
 }
 
 //----- format the status buffer, the bottom line of screen ------
@@ -3031,10 +3148,11 @@ static int format_edit_status(const char *fmt)
 }
 
 //----- Force refresh of all Lines -----------------------------
-static void redraw(int full_screen)
+static void redraw(void)
 {
-	clear_screen();
-	refresh(full_screen);	// this will redraw the entire display
+	clear_screen();		//clear teminal screen and our image of it
+	screen_erase();
+	refresh();
 }
 
 //----- Format a text[] line into a buffer ---------------------
@@ -3100,25 +3218,24 @@ static char* format_line(char *src /*, int li*/)
 // if the current screenline is different from the new buffer.
 // If they differ then that line needs redrawing on the terminal.
 //
-static void refresh(int full_screen)
+static void refresh(void)
 {
 #define old_offset refresh__old_offset
 
 	int li, changed;
 	char *tp, *sp;		// pointer into text[] and screen[]
 
-	if (ENABLE_FEATURE_VI_WIN_RESIZE) {
-		unsigned c = columns, r = rows;
-		get_terminal_width_height(0, &columns, &rows);
-		if (rows > MAX_SCR_ROWS) rows = MAX_SCR_ROWS;
-		if (columns > MAX_SCR_COLS) columns = MAX_SCR_COLS;
-		full_screen |= (c - columns) | (r - rows);
-	}
+	// poll to see if there is input already waiting. if we are
+	// not able to display output fast enough to keep up, skip
+	// the display update until we catch up with input.
+	if (chars_to_parse || awaitInput(0))
+		return;
+
 	sync_cursor(dot, &crow, &ccol);	// where cursor will be (on "dot")
 	tp = screenbegin;	// index into text[] of top line
 
 	// compare text[] to screen[] and mark screen[] lines that need updating
-	for (li = 0; li < rows - 1; li++) {
+	for (li = 0; li < rows - 1 && !awaitInput(0); li++) {
 		int cs, ce;				// column start & end
 		char *out_buf;
 		// format current text line
@@ -3136,10 +3253,6 @@ static void refresh(int full_screen)
 		cs = 0;
 		ce = columns - 1;
 		sp = &screen[li * columns];	// start of screen line
-		if (full_screen) {
-			// force re-draw of every single column from 0 - columns-1
-			goto re0;
-		}
 		// compare newly formatted buffer with virtual screen
 		// look forward for first difference between buf and screen
 		for (; cs <= ce; cs++) {
@@ -3160,7 +3273,6 @@ static void refresh(int full_screen)
 
 		// if horz offset has changed, force a redraw
 		if (offset != old_offset) {
-re0:
 			changed = TRUE;
 		}
 
@@ -3168,7 +3280,7 @@ re0:
 		if (cs < 0) cs = 0;
 		if (ce > columns - 1) ce = columns - 1;
 		if (cs > ce) { cs = 0; ce = columns - 1; }
-		// is there a change between vitual screen and out_buf
+		// is there a change between virtual screen and out_buf
 		if (changed) {
 			// copy changed part of buffer to virtual screen
 			memcpy(sp+cs, out_buf+cs, ce-cs+1);
@@ -3353,11 +3465,8 @@ repeat:
 		goto repeat;
 	case 12:			// ctrl-L  force redraw whole screen
 	case 18:			// ctrl-R  force redraw
-		place_cursor(0, 0, FALSE);	// put cursor in correct place
-		clear_to_eos();	// tel terminal to erase display
-		mysleep(10);
-		screen_erase();	// erase the internal screen buffer
-		refresh(TRUE);	// this will redraw the entire display
+		createScreen();
+		redraw();
 		break;
 	case 13:			// Carriage Return ^M
 	case '+':			// +- goto next line
@@ -4209,7 +4318,7 @@ static void crash_dummy()
  cd1:
 	totalcmds++;
 	if (sleeptime > 0)
-		mysleep(sleeptime);      // sleep 1/100 sec
+		awaitInput(sleeptime);      // sleep 1/100 sec
 }
 
 // test to see if there are any errors
