@@ -216,7 +216,7 @@ enum {  //cmd_modes
 };
 
 static const char *cmd_mode_indicator[] =
-	{"COMMAND", "INSERT", "REPLACE", "?!?" };
+	{"-", "I", "R", "?" };
 
 /* vi.c expects chars to be unsigned. */
 /* busybox build system provides that, but it's better */
