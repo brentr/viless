@@ -3942,11 +3942,11 @@ dc5:
 	case 'Z':			// Z- if modified, {write}; exit
 		// ZZ means to save file (if necessary), then exit
 		c1 = get_one_char();
-		if (c1 != 'Z') {
+		if (c1 != 'Z' && c1 != 'Q') {
 			indicate_error(c);
 			break;
 		}
-		if (file_modified) {
+		if (file_modified && c1 != 'Q') {
 			if (ENABLE_FEATURE_VI_READONLY && readonly_mode) {
 				status_line_bold("\"%s\" File is read only", current_filename);
 				break;
