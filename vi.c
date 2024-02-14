@@ -6,6 +6,7 @@
  * Licensed under the GPL v2 or later, see the file LICENSE in this tarball.
  * Revised:  4/23/20 brent@mbari.org -- NULL ptr deref on missing previous regex
  * Revised:	 5/21/20 brent@mbari.org -- extensive rework
+ * Revised:	 2/14/24 Stefan Haubental -- added support for clang
  */
 
 /*
@@ -24,7 +25,7 @@
  */
 
 #ifdef STANDALONE
-#define BB_VER "version 2.62"
+#define BB_VER "version 2.63"
 #define BB_BT "brent@mbari.org"
 
 #define _GNU_SOURCE
@@ -92,6 +93,29 @@ typedef signed char smallint;
 //    Ctrl-Z and kill -9 %1
 // while in the editor Ctrl-T will toggle the crashme function on and off.
 //#define CONFIG_FEATURE_VI_CRASHME		// randomly pick commands to execute
+
+#ifdef __clang__
+char *strchrnul(const char *s, int c_in)
+{
+        char c = c_in;
+
+        while (*s && (*s != c))
+                s++;
+        return (char *) s;
+}
+
+void *memrchr(const void *s, int c_in, size_t n)
+{
+        if (n != 0) {
+                const unsigned char *cp = (unsigned char *)s + n;
+                do {
+                        if (*(--cp) == (unsigned char) c_in)
+                                return (void *) cp;
+                } while (--n != 0);
+        }
+        return NULL;
+}
+#endif
 
 #else  //in busybox
 
