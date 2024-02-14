@@ -93,6 +93,29 @@ typedef signed char smallint;
 // while in the editor Ctrl-T will toggle the crashme function on and off.
 //#define CONFIG_FEATURE_VI_CRASHME		// randomly pick commands to execute
 
+#ifdef __clang__
+char *strchrnul(const char *s, int c_in)
+{
+        char c = c_in;
+
+        while (*s && (*s != c))
+                s++;
+        return (char *) s;
+}
+
+void *memrchr(const void *s, int c_in, size_t n)
+{
+        if (n != 0) {
+                const unsigned char *cp = (unsigned char *)s + n;
+                do {
+                        if (*(--cp) == (unsigned char) c_in)
+                                return (void *) cp;
+                } while (--n != 0);
+        }
+        return NULL;
+}
+#endif
+
 #else  //in busybox
 
 #include "libbb.h"
